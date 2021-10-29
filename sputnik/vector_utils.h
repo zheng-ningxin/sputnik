@@ -20,6 +20,7 @@
  */
 
 #include "sputnik/cuda_utils.h"
+#include "cuda_fp16.h"
 #include "sputnik/type_utils.h"
 
 namespace sputnik {

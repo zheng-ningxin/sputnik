@@ -33,12 +33,14 @@ void ReportThroughput(benchmark::State& state) {
 }
 
 void BenchmarkArgs(benchmark::internal::Benchmark* b) {
-  std::vector<int> dims = {512, 1024, 2048, 4096, 8192};
+  std::vector<int> dim_m = {768, 768, 3072, 3072};
+  std::vector<int> dim_k = {768, 3072, 768, 3072};
+  std::vector<int> dim_n = {4096, 4096, 4096, 768};
   std::vector<float> sparsities = {.25f, .2f, .15f, .1f, .05f};
 
-  for (const auto& d : dims) {
+  for (int i=0; i<dim_m.size(); i++) {
     for (const auto& s : sparsities) {
-      b->Args({d, d, d, static_cast<int>(d * d * s)});
+      b->Args({dim_m[i], dim_k[i], dim_n[i], static_cast<int>(dim_m[i] * dim_k[i] * s)});
     }
   }
 }

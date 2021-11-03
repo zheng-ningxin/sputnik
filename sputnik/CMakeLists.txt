@@ -62,7 +62,16 @@ target_link_libraries(sputnik ${SPUTNIK_LIBS})
 # Library installation.
 install(TARGETS sputnik)
 
+add_library(spmm SHARED ${SPUTNIK_SRCS})
+target_link_libraries(spmm ${SPUTNIK_LIBS})
+
+# Library installation.
+install(TARGETS spmm)
+
+
 set(INSTALL_BASE "include/sputnik")
+
+
 install(FILES "cuda_utils.h" DESTINATION ${INSTALL_BASE})
 install(FILES "sputnik.h" DESTINATION ${INSTALL_BASE})
 install(FILES "bias_relu/bias_relu.h" DESTINATION "${INSTALL_BASE}/bias_relu")

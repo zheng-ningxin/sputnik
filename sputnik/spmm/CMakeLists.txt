@@ -18,7 +18,6 @@ set(FILTER_SRCS)
 # Don't need test files.
 file(GLOB TMP *_test.cu.cc)
 list(APPEND FILTER_SRCS ${TMP})
-
 # Don't need benchmark files.
 file(GLOB TMP *_benchmark.cu.cc)
 list(APPEND FILTER_SRCS ${TMP})
@@ -29,7 +28,7 @@ endforeach(FILE)
 
 # Add the sources to the build.
 set(SPUTNIK_SRCS ${SPUTNIK_SRCS} ${DIR_SRCS} PARENT_SCOPE)
-
+set(SPMM_LIBRARY_SRC ${DIR_SRCS} PARENT_SCOPE)
 # Conditionally gather test sources.
 if (BUILD_TEST)
   file(GLOB TMP *_test.cu.cc)

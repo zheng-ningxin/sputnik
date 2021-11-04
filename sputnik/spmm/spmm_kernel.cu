@@ -9,8 +9,22 @@
 #include "sputnik/spmm/cuda_spmm.h"
 #include "sputnik/spmm/spmm_config.h"
 #include "sputnik/test_utils.h"
+#include "iostream"
+#include "sstream"
+#include "cuda.h"
+#include "time.h"
+#include "memory"
+#include "cublas_v2.h"
+#include "vector"
+
 using namespace std;
 using namespace sputnik;
+
+int32_t * row_idx, *col_idx, *d_row_idx, *d_col_idx, *row_swizzle, *d_row_swizzle;
+int32_t row_idx_size, col_idx_size, values_size;
+float * values, *d_values;
+float * matA, *matB, matC,*d_matA, *d_matB, *d_matC;
+int m, k, n;
 
 #define CUDA_SAFE_CALL(x)                                                                          \
     do                                                                                             \
@@ -58,7 +72,21 @@ size_t load_from_file(char* ptr, size_t buff_size, string file_path)
     return loaded_size;
 }
 
-
+void init(float * ptr, size_t length, float sparsity)
+{
+    for (int i = 0; i < length; i++)
+    {
+        float pro = static_cast<float>(rand()) / static_cast<float>(RAND_MAX);
+        if (pro < sparsity)
+        {
+            ptr[i] = 0.0;
+        }
+        else
+        {
+            ptr[i] = static_cast<float>(rand()) / static_cast<float>(RAND_MAX);
+        }
+    }
+}
 void SortedRowSwizzle(int rows, int *row_offsets, int *row_indices) {
   // Create our unsorted row indices.
   std::vector<int> swizzle_staging(rows);
@@ -75,42 +103,82 @@ void SortedRowSwizzle(int rows, int *row_offsets, int *row_indices) {
   // Copy the ordered row indices to the output.
   std::memcpy(row_indices, swizzle_staging.data(), sizeof(int) * rows);
 }
+void convert_csr(float * ptr, int32_t row, int32_t col, int32_t * &row_idx, int32_t * &col_idx, float * &values)
+{
+    auto v_row_idx = std::make_shared<vector<int32_t>>();
+    auto v_col_idx = std::make_shared<vector<int32_t>>();
+    auto v_values = std::make_shared<vector<float>>();
+
+    for (int i = 0; i < row; i++)
+    {
+        v_row_idx->push_back(v_values->size());
+        for (int j = 0; j < col; j++)
+        {
+            size_t pos = i * col + j;
+            if (ptr[pos] < 1e-8)
+            {
+                // sparsity
+                continue;
+            }
+            else
+            {
+                v_values->push_back(ptr[pos]);
+                v_col_idx->push_back(j);
+            }
+        }
+    }
+    v_row_idx->push_back(v_values->size());
+    row_idx_size = sizeof(int32_t)*v_row_idx->size();
+    col_idx_size = sizeof(int32_t)*v_col_idx->size();
+    values_size = sizeof(float)*v_values->size();
+    row_idx = (int32_t*) malloc(row_idx_size);
+    col_idx = (int32_t*) malloc(col_idx_size);
+    values = (float*) malloc(values_size);
+    memcpy(row_idx, v_row_idx->data(), row_idx_size);
+    memcpy(col_idx, v_col_idx->data(), col_idx_size);
+    memcpy(values, v_values->data(), values_size);
+}
 int main()
 {
     string row_f, col_f, value_f;
-    int m, k, n;
-    cin >> m >> k >> n >> row_f >> col_f >> value_f;
+    int m=768, k=768, n=4096;
+    int sparsity = 0.95;
+    matA = (float*) malloc(sizeof(float)*m*k);
+    matB = (float*) malloc(sizeof(float)*k*n);
+    matC = (float*) malloc(sizeof(float)*m*n);
+    init(matA, m*k, sparsity);
+    init(matB, k*n, 0);
+    convert_csr(matA, m, k, row_idx, col_idx, values);
 
-    int * d_row_index, *d_col_index, *d_row_swizzle;
-    float *d_values, *d_dense_m, *d_output_m;
-    int * row_index, *col_index, *row_swizzle;
-    float *values, *dense_m, *output_m;
-    size_t enough_memory_size = 4096 * 4096 * sizeof(float);
-    row_index = (int *)malloc(enough_memory_size);
-    col_index = (int *)malloc(enough_memory_size);
-    row_swizzle = (int *)malloc(enough_memory_size);
-    values = (float *)malloc(enough_memory_size);
-    dense_m = (float*) malloc(enough_memory_size);
-    output_m = (float*) malloc(enough_memory_size);
-
-    CUDA_SAFE_CALL(cudaMalloc((void**)&d_row_index, enough_memory_size));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&d_col_index, enough_memory_size));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&d_values, enough_memory_size));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&d_output_m, enough_memory_size));
-    CUDA_SAFE_CALL(cudaMalloc((void**)&d_row_swizzle, enough_memory_size));
-
-    load_from_file((char*)row_index, enough_memory_size, row_f);
-    load_from_file((char*)col_index, enough_memory_size, col_f);
-    SortedRowSwizzle(m, row_index, row_swizzle);
-    CUDA_SAFE_CALL(cudaMemcpy(row_index, d_row_index, enough_memory_size, cudaMemcpyHostToDevice));
-    CUDA_SAFE_CALL(cudaMemcpy(col_index, d_col_index, enough_memory_size, cudaMemcpyHostToDevice));
-    CUDA_SAFE_CALL(cudaMemcpy(row_swizzle, d_row_swizzle, enough_memory_size, cudaMemcpyHostToDevice));
-
-    size_t nnz = load_from_file((char*)values, enough_memory_size, value_f)/sizeof(float);
-
-    CUDA_SAFE_CALL(cudaMalloc((void**)&dense_m, sizeof(float)*k*n));
-    CUDA_SAFE_CALL(CudaSpmm(m, k, n, nnz, row_swizzle, values, row_index, col_index, dense_m, output_m, 0));
-
-
+    cublasHandle_t cublas_handle;
+    CUSPARSE_SAFE_CALL(cusparseCreate(&cusparse_handle));
+    CUBLAS_SAFE_CALL(cublasCreate(&cublas_handle));
+    CUDA_SAFE_CALL(cudaMalloc(&d_matA, sizeof(float)*m*k));
+    CUDA_SAFE_CALL(cudaMalloc(&d_matB, sizeof(float)*n*k));
+    CUDA_SAFE_CALL(cudaMalloc(&d_row_idx, row_idx_size));
+    CUDA_SAFE_CALL(cudaMalloc(&d_col_idx, col_idx_size));
+    CUDA_SAFE_CALL(cudaMalloc(&d_values, values_size));
+    CUDA_SAFE_CALL(cudaMalloc(&d_matC, sizeof(float)*m*n));
+    CUDA_SAFE_CALL(cudaMemcpy(d_matA, matA, sizeof(float)*m*k, cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(d_matB, matB, sizeof(float)*n*k, cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(d_row_idx, row_idx, row_idx_size, cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(d_col_idx, col_idx, col_idx_size, cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(d_values, values, values_size, cudaMemcpyHostToDevice));
+    row_swizzle = (int *) malloc(sizeof(int) * m);
+    CUDA_SAFE_CALL(cudaMalloc(&d_row_swizzle, sizeof(int)*m));
+    SortedRowSwizzle(m, row_idx, row_swizzle);
+    CUDA_SAFE_CALL(cudaMemcpy(row_swizzle, d_row_swizzle, sizeof(int)*m, cudaMemcpyHostToDevice));
+    int nnz = values_size / sizeof(float);
+    
+    CUDA_SAFE_CALL(CudaSpmm(m, k, n, nnz, d_row_swizzle, d_values, d_row_idx, d_col_idx, matB, d_matC, 0));
+    CUDA_SAFE_CALL(cudaMemcp(matC, d_matC, sizeof(float)*m*n), cudaMemcpyDeviceToHost);
+    for(int i=0;i<20;i++)
+        std::cout<<matC[i]<<" ";
+    std::cout<<std::endl;
+    CUBLAS_SAFE_CALL(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, m, n, k, &alpha, d_matA, m, d_matB, k, &beta, d_matC, m));
+    CUDA_SAFE_CALL(cudaMemcp(matC, d_matC, sizeof(float)*m*n), cudaMemcpyDeviceToHost);
+    for(int i=0;i<20;i++)
+        std::cout<<matC[i]<<" ";
+    std::cout<<std::endl;
     return 0;
 }

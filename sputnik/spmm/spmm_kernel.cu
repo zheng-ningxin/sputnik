@@ -23,9 +23,9 @@ using namespace sputnik;
 int32_t * row_idx, *col_idx, *d_row_idx, *d_col_idx, *row_swizzle, *d_row_swizzle;
 int32_t row_idx_size, col_idx_size, values_size;
 float * values, *d_values;
-float * matA, *matB, matC,*d_matA, *d_matB, *d_matC;
+float * matA, *matB, *matC,*d_matA, *d_matB, *d_matC;
 int m, k, n;
-
+float alpha=1.0, beta=0.0;
 #define CUDA_SAFE_CALL(x)                                                                          \
     do                                                                                             \
     {                                                                                              \
@@ -151,7 +151,6 @@ int main()
     convert_csr(matA, m, k, row_idx, col_idx, values);
 
     cublasHandle_t cublas_handle;
-    CUSPARSE_SAFE_CALL(cusparseCreate(&cusparse_handle));
     CUBLAS_SAFE_CALL(cublasCreate(&cublas_handle));
     CUDA_SAFE_CALL(cudaMalloc(&d_matA, sizeof(float)*m*k));
     CUDA_SAFE_CALL(cudaMalloc(&d_matB, sizeof(float)*n*k));
@@ -167,18 +166,27 @@ int main()
     row_swizzle = (int *) malloc(sizeof(int) * m);
     CUDA_SAFE_CALL(cudaMalloc(&d_row_swizzle, sizeof(int)*m));
     SortedRowSwizzle(m, row_idx, row_swizzle);
-    CUDA_SAFE_CALL(cudaMemcpy(row_swizzle, d_row_swizzle, sizeof(int)*m, cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(d_row_swizzle, row_swizzle, sizeof(int)*m, cudaMemcpyHostToDevice));
     int nnz = values_size / sizeof(float);
     
-    CUDA_SAFE_CALL(CudaSpmm(m, k, n, nnz, d_row_swizzle, d_values, d_row_idx, d_col_idx, matB, d_matC, 0));
-    CUDA_SAFE_CALL(cudaMemcp(matC, d_matC, sizeof(float)*m*n), cudaMemcpyDeviceToHost);
+    CUDA_SAFE_CALL(CudaSpmm(m, k, n, nnz, d_row_swizzle, d_values, d_row_idx, d_col_idx, d_matB, d_matC, 0));
+    CUDA_SAFE_CALL(cudaMemcpy(matC, d_matC, sizeof(float)*m*n, cudaMemcpyDeviceToHost));
     for(int i=0;i<20;i++)
         std::cout<<matC[i]<<" ";
-    std::cout<<std::endl;
-    CUBLAS_SAFE_CALL(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, m, n, k, &alpha, d_matA, m, d_matB, k, &beta, d_matC, m));
-    CUDA_SAFE_CALL(cudaMemcp(matC, d_matC, sizeof(float)*m*n), cudaMemcpyDeviceToHost);
+    std::cout<<"\n"<<std::endl;
+    memset(matC, 0,sizeof(float)*m*n);
+    for(int i=0;i<m;i++){
+        for(int j=0; j<n;j++){
+            for(int tmp=0;tmp<k;tmp++){
+                // matc[i][j] = sum(A[i][tmp]*B[tmp][j])
+                matC[i*n+j] += matA[i*k+tmp] * matB[tmp*n+j];
+            }
+        }
+    }
+    // CUBLAS_SAFE_CALL(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, m, n, k, &alpha, d_matA, m, d_matB, k, &beta, d_matC, m));
+    // CUDA_SAFE_CALL(cudaMemcpy(matC, d_matC, sizeof(float)*m*n, cudaMemcpyDeviceToHost));
     for(int i=0;i<20;i++)
         std::cout<<matC[i]<<" ";
-    std::cout<<std::endl;
+    std::cout<<"\n"<<std::endl;
     return 0;
 }

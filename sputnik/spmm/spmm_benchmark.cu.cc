@@ -1,182 +1,192 @@
-// Copyright 2020 The Sputnik Authors.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 #include <cmath>
 #include <cstdint>
-
+#include <cudnn.h>
+#include <cuda.h>
+#include <fstream>
+#include <cuda_runtime.h>
 #include "sputnik/cuda_utils.h"
 #include "sputnik/matrix_utils.h"
 #include "sputnik/spmm/cuda_spmm.h"
 #include "sputnik/spmm/spmm_config.h"
 #include "sputnik/test_utils.h"
+#include "iostream"
+#include "sstream"
+#include "cuda.h"
+#include "time.h"
+#include "memory"
+#include "cublas_v2.h"
+#include "vector"
 
-#include "absl/random/random.h"
-#include "benchmark/benchmark.h"
+using namespace std;
+using namespace sputnik;
 
-namespace sputnik {
+int32_t * row_idx, *col_idx, *d_row_idx, *d_col_idx, *row_swizzle, *d_row_swizzle;
+int32_t row_idx_size, col_idx_size, values_size;
+float * values, *d_values;
+float * matA, *matB, *matC,*d_matA, *d_matB, *d_matC;
+int m, k, n;
+float alpha=1.0, beta=0.0;
+#define CUDA_SAFE_CALL(x)                                                                          \
+    do                                                                                             \
+    {                                                                                              \
+        cudaError_t result = (x);                                                                  \
+        if (result != cudaSuccess)                                                                 \
+        {                                                                                          \
+            const char* msg = cudaGetErrorString(result);                                          \
+            std::stringstream safe_call_ss;                                                        \
+            safe_call_ss << "\nerror: " #x " failed with error"                                    \
+                         << "\nfile: " << __FILE__ << "\nline: " << __LINE__ << "\nmsg: " << msg;  \
+            throw std::runtime_error(safe_call_ss.str());                                          \
+        }                                                                                          \
+    } while (0)
+#define CUDNN_SAFE_CALL(func)                                                                      \
+    do                                                                                             \
+    {                                                                                              \
+        cudnnStatus_t e = (func);                                                                  \
+        if (e != CUDNN_STATUS_SUCCESS)                                                             \
+        {                                                                                          \
+            const char* msg = cudnnGetErrorString(e);                                              \
+            std::stringstream safe_call_ss;                                                        \
+            safe_call_ss << "\nerror: " #func " failed with error"                                 \
+                         << "\nfile: " << __FILE__ << "\nline: " << __LINE__ << "\nmsg: " << msg;  \
+            throw std::runtime_error(safe_call_ss.str());                                          \
+        }                                                                                          \
+    } while (0)
+#define CUBLAS_SAFE_CALL(func)                                                                     \
+    do                                                                                             \
+    {                                                                                              \
+        cublasStatus_t e = (func);                                                                 \
+        if (e != CUBLAS_STATUS_SUCCESS)                                                            \
+        {                                                                                          \
+            std::stringstream safe_call_ss;                                                        \
+            safe_call_ss << "\nerror: " #func " failed with error"                                 \
+                         << "\nfile: " << __FILE__ << "\nline: " << __LINE__ << "\nmsg: " << e;    \
+            throw std::runtime_error(safe_call_ss.str());                                          \
+        }                                                                                          \
+    } while (0)
 
-void ReportThroughput(benchmark::State& state) {
-  state.SetBytesProcessed(
-      static_cast<int64_t>(state.iterations()) *
-      state.range(3) * state.range(2) * 2);
+size_t load_from_file(char* ptr, size_t buff_size, string file_path)
+{
+    std::ifstream fin(file_path, ios::in | ios::binary);
+    size_t loaded_size = fin.read(ptr, buff_size).gcount();
+    return loaded_size;
 }
 
-void BenchmarkArgs(benchmark::internal::Benchmark* b) {
-  std::vector<int> dim_m = {768, 768, 3072, 3072};
-  std::vector<int> dim_k = {768, 3072, 768, 3072};
-  std::vector<int> dim_n = {4096, 4096, 4096, 768};
-  std::vector<float> sparsities = {.25f, .2f, .15f, .1f, .05f};
-
-  for (int i=0; i<dim_m.size(); i++) {
-    for (const auto& s : sparsities) {
-      b->Args({dim_m[i], dim_k[i], dim_n[i], static_cast<int>(dim_m[i] * dim_k[i] * s)});
+void init(float * ptr, size_t length, float sparsity)
+{
+    for (int i = 0; i < length; i++)
+    {
+        float pro = static_cast<float>(rand()) / static_cast<float>(RAND_MAX);
+        if (pro < sparsity)
+        {
+            ptr[i] = 0.0;
+        }
+        else
+        {
+            ptr[i] = static_cast<float>(rand()) / static_cast<float>(RAND_MAX);
+        }
     }
-  }
 }
+void SortedRowSwizzle(int rows, int *row_offsets, int *row_indices) {
+  // Create our unsorted row indices.
+  std::vector<int> swizzle_staging(rows);
+  std::iota(swizzle_staging.begin(), swizzle_staging.end(), 0);
 
-void BM_CudaSpmm_GenericFloat(benchmark::State& state) {
-  const int kDimM = state.range(0);
-  const int kDimK = state.range(1);
-  const int kDimN = state.range(2);
-  const int kNonZeros = state.range(3);
+  // Argsort the row indices based on their length.
+  std::sort(swizzle_staging.begin(), swizzle_staging.end(),
+            [&row_offsets](int idx_a, int idx_b) {
+              int length_a = row_offsets[idx_a + 1] - row_offsets[idx_a];
+              int length_b = row_offsets[idx_b + 1] - row_offsets[idx_b];
+              return length_a > length_b;
+            });
 
-  const int kRowPadding = 0;
+  // Copy the ordered row indices to the output.
+  std::memcpy(row_indices, swizzle_staging.data(), sizeof(int) * rows);
+}
+void convert_csr(float * ptr, int32_t row, int32_t col, int32_t * &row_idx, int32_t * &col_idx, float * &values)
+{
+    auto v_row_idx = std::make_shared<vector<int32_t>>();
+    auto v_col_idx = std::make_shared<vector<int32_t>>();
+    auto v_values = std::make_shared<vector<float>>();
 
-  // Create the sparse matrix on the gpu.
-  absl::BitGen generator;
-  CudaSparseMatrix<float> sparse_matrix_gpu(
-      kDimM, kDimK, kNonZeros, RANDOM_UNIFORM, &generator, SORTED, kRowPadding);
-
-  // Create the dense matrix on the gpu.
-  CudaMatrix<float> matrix_gpu(kDimK, kDimN, &generator);
-
-  // Create the output matrix on the gpu.
-  CudaMatrix<float> output_matrix_gpu(kDimM, kDimN, &generator);
-
-  int batch_size = 10;
-  while (state.KeepRunningBatch(batch_size)) {
-    for (int i = 0; i < batch_size; ++i) {
-      CUDA_CALL(CudaSpmm(
-          kDimM, kDimK, kDimN, sparse_matrix_gpu.NumElementsWithPadding(),
-          sparse_matrix_gpu.RowIndices(), sparse_matrix_gpu.Values(),
-          sparse_matrix_gpu.RowOffsets(), sparse_matrix_gpu.ColumnIndices(),
-          matrix_gpu.Values(), output_matrix_gpu.Values(), 0));
+    for (int i = 0; i < row; i++)
+    {
+        v_row_idx->push_back(v_values->size());
+        for (int j = 0; j < col; j++)
+        {
+            size_t pos = i * col + j;
+            if (ptr[pos] < 1e-8)
+            {
+                // sparsity
+                continue;
+            }
+            else
+            {
+                v_values->push_back(ptr[pos]);
+                v_col_idx->push_back(j);
+            }
+        }
     }
-    CUDA_CALL(cudaStreamSynchronize(nullptr));
-  }
-  ReportThroughput(state);
+    v_row_idx->push_back(v_values->size());
+    row_idx_size = sizeof(int32_t)*v_row_idx->size();
+    col_idx_size = sizeof(int32_t)*v_col_idx->size();
+    values_size = sizeof(float)*v_values->size();
+    row_idx = (int32_t*) malloc(row_idx_size);
+    col_idx = (int32_t*) malloc(col_idx_size);
+    values = (float*) malloc(values_size);
+    memcpy(row_idx, v_row_idx->data(), row_idx_size);
+    memcpy(col_idx, v_col_idx->data(), col_idx_size);
+    memcpy(values, v_values->data(), values_size);
 }
+int main()
+{
+    string row_f, col_f, value_f;
+    int m=768, k=768, n=4096;
+    int sparsity = 0.95;
+    matA = (float*) malloc(sizeof(float)*m*k);
+    matB = (float*) malloc(sizeof(float)*k*n);
+    matC = (float*) malloc(sizeof(float)*m*n);
+    init(matA, m*k, sparsity);
+    init(matB, k*n, 0);
+    convert_csr(matA, m, k, row_idx, col_idx, values);
 
-BENCHMARK(BM_CudaSpmm_GenericFloat)->Apply(BenchmarkArgs)->UseRealTime();
-
-void ReportGemmThroughput(benchmark::State& state) {
-  state.SetBytesProcessed(
-      static_cast<int64_t>(state.iterations()) *
-      state.range(0) * state.range(1) * state.range(2) * 2);
-}
-
-void GemmBenchmarkArgs(benchmark::internal::Benchmark* b) {
-  std::vector<int> dims = {512, 1024, 2048, 4096, 8192};
-
-  for (const auto& d : dims) {
-    b->Args({d, d, d});
-  }
-}
-
-void BM_CublasGemm_ColumnMajor(benchmark::State& state) {
-  int m = state.range(0);
-  int k = state.range(1);
-  int n = state.range(2);
-
-  // Create the lhs, rhs, and output matrices on gpu.
-  absl::BitGen generator;
-  CudaMatrix<float> lhs_gpu(m, k, &generator);
-  CudaMatrix<float> rhs_gpu(k, n, &generator);
-  CudaMatrix<float> output_gpu(m, n, &generator);
-
-  // Setup CuBLAS specific data structures.
-  cublasHandle_t handle;
-  CUBLAS_CALL(cublasCreate(&handle));
-  CUBLAS_CALL(cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_HOST));
-  float alpha = 1.0, beta = 0.0;
-  cudaDataType_t data_type = CUDA_R_32F;
-  cudaDataType_t compute_type = CUDA_R_32F;
-  cublasGemmAlgo_t gemm_algorithm = CUBLAS_GEMM_DEFAULT;
-
-  int batch_size = 10;
-  while (state.KeepRunningBatch(batch_size)) {
-    for (int i = 0; i < batch_size; ++i) {
-      // Run the cublas kernel.
-      CUBLAS_CALL(cublasGemmEx(
-          handle, CUBLAS_OP_N, CUBLAS_OP_N, m, n, k, &alpha, lhs_gpu.Values(),
-          data_type, m, rhs_gpu.Values(), data_type, k, &beta,
-          output_gpu.Values(), data_type, m, compute_type, gemm_algorithm));
+    cublasHandle_t cublas_handle;
+    CUBLAS_SAFE_CALL(cublasCreate(&cublas_handle));
+    CUDA_SAFE_CALL(cudaMalloc(&d_matA, sizeof(float)*m*k));
+    CUDA_SAFE_CALL(cudaMalloc(&d_matB, sizeof(float)*n*k));
+    CUDA_SAFE_CALL(cudaMalloc(&d_row_idx, row_idx_size));
+    CUDA_SAFE_CALL(cudaMalloc(&d_col_idx, col_idx_size));
+    CUDA_SAFE_CALL(cudaMalloc(&d_values, values_size));
+    CUDA_SAFE_CALL(cudaMalloc(&d_matC, sizeof(float)*m*n));
+    CUDA_SAFE_CALL(cudaMemcpy(d_matA, matA, sizeof(float)*m*k, cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(d_matB, matB, sizeof(float)*n*k, cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(d_row_idx, row_idx, row_idx_size, cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(d_col_idx, col_idx, col_idx_size, cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(d_values, values, values_size, cudaMemcpyHostToDevice));
+    row_swizzle = (int *) malloc(sizeof(int) * m);
+    CUDA_SAFE_CALL(cudaMalloc(&d_row_swizzle, sizeof(int)*m));
+    SortedRowSwizzle(m, row_idx, row_swizzle);
+    CUDA_SAFE_CALL(cudaMemcpy(d_row_swizzle, row_swizzle, sizeof(int)*m, cudaMemcpyHostToDevice));
+    int nnz = values_size / sizeof(float);
+    
+    CUDA_SAFE_CALL(CudaSpmm(m, k, n, nnz, d_row_swizzle, d_values, d_row_idx, d_col_idx, d_matB, d_matC, 0));
+    CUDA_SAFE_CALL(cudaMemcpy(matC, d_matC, sizeof(float)*m*n, cudaMemcpyDeviceToHost));
+    for(int i=0;i<20;i++)
+        std::cout<<matC[i]<<" ";
+    std::cout<<"\n"<<std::endl;
+    memset(matC, 0,sizeof(float)*m*n);
+    for(int i=0;i<m;i++){
+        for(int j=0; j<n;j++){
+            for(int tmp=0;tmp<k;tmp++){
+                // matc[i][j] = sum(A[i][tmp]*B[tmp][j])
+                matC[i*n+j] += matA[i*k+tmp] * matB[tmp*n+j];
+            }
+        }
     }
-    CUDA_CALL(cudaStreamSynchronize(0));
-  }
-  ReportGemmThroughput(state);
+    // CUBLAS_SAFE_CALL(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, m, n, k, &alpha, d_matA, m, d_matB, k, &beta, d_matC, m));
+    // CUDA_SAFE_CALL(cudaMemcpy(matC, d_matC, sizeof(float)*m*n, cudaMemcpyDeviceToHost));
+    for(int i=0;i<20;i++)
+        std::cout<<matC[i]<<" ";
+    std::cout<<"\n"<<std::endl;
+    return 0;
 }
-
-BENCHMARK(BM_CublasGemm_ColumnMajor)->Apply(GemmBenchmarkArgs)->UseRealTime();
-
-cublasStatus_t RowMajorGemm(cublasHandle_t handle, bool trans_a,
-                            const CudaMatrix<float>& a, bool trans_b,
-                            const CudaMatrix<float>& b, CudaMatrix<float>* c) {
-  int m = trans_b ? b.Rows() : b.Columns();
-  int k = trans_b ? b.Columns() : b.Rows();
-  int n = trans_a ? a.Columns() : a.Rows();
-
-  int ldb = trans_b ? k : m;
-  int lda = trans_a ? n : k;
-  cublasOperation_t transpose_a = trans_a ? CUBLAS_OP_T : CUBLAS_OP_N;
-  cublasOperation_t transpose_b = trans_b ? CUBLAS_OP_T : CUBLAS_OP_N;
-
-  float alpha = 1.0, beta = 0.0;
-  return cublasGemmEx(handle, transpose_b, transpose_a, m, n, k, &alpha,
-                      b.Values(), CUDA_R_32F, ldb, a.Values(), CUDA_R_32F, lda,
-                      &beta, c->Values(), CUDA_R_32F, c->Columns(), CUDA_R_32F,
-                      CUBLAS_GEMM_DEFAULT);
-}
-
-void BM_CublasGemm_RowMajor(benchmark::State& state) {
-  int m = state.range(0);
-  int k = state.range(1);
-  int n = state.range(2);
-
-  // Create the lhs, rhs, and output matrices on gpu.
-  absl::BitGen generator;
-  CudaMatrix<float> lhs_gpu(m, k, &generator);
-  CudaMatrix<float> rhs_gpu(k, n, &generator);
-  CudaMatrix<float> output_gpu(m, n, &generator);
-
-  // Setup CuBLAS specific data structures.
-  cublasHandle_t handle;
-  CUBLAS_CALL(cublasCreate(&handle));
-  CUBLAS_CALL(cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_HOST));
-
-  int batch_size = 10;
-  while (state.KeepRunningBatch(batch_size)) {
-    for (int i = 0; i < batch_size; ++i) {
-      // Run the cublas kernel.
-      CUBLAS_CALL(
-          RowMajorGemm(handle, false, lhs_gpu, false, rhs_gpu, &output_gpu));
-    }
-    CUDA_CALL(cudaStreamSynchronize(0));
-  }
-  ReportGemmThroughput(state);
-}
-
-BENCHMARK(BM_CublasGemm_RowMajor)->Apply(GemmBenchmarkArgs)->UseRealTime();
-
-}  // namespace sputnik

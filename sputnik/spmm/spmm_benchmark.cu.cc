@@ -20,6 +20,13 @@
 using namespace std;
 using namespace sputnik;
 
+#define checkCudaErrors(func)				\
+{									\
+    cudaError_t e = (func);			\
+    if(e != cudaSuccess)						                \
+        printf ("%s %d CUDA: %s\n", __FILE__,  __LINE__, cudaGetErrorString(e));		\
+}
+
 int32_t * row_idx, *col_idx, *d_row_idx, *d_col_idx, *row_swizzle, *d_row_swizzle;
 int32_t row_idx_size, col_idx_size, values_size;
 float * values, *d_values;
@@ -77,6 +84,7 @@ void init(float * ptr, size_t length, float sparsity)
     for (int i = 0; i < length; i++)
     {
         float pro = static_cast<float>(rand()) / static_cast<float>(RAND_MAX);
+        //printf("pro: %f\n", pro);
         if (pro < sparsity)
         {
             ptr[i] = 0.0;
@@ -131,6 +139,7 @@ void convert_csr(float * ptr, int32_t row, int32_t col, int32_t * &row_idx, int3
     row_idx_size = sizeof(int32_t)*v_row_idx->size();
     col_idx_size = sizeof(int32_t)*v_col_idx->size();
     values_size = sizeof(float)*v_values->size();
+    printf("values_size: %d\n", values_size);
     row_idx = (int32_t*) malloc(row_idx_size);
     col_idx = (int32_t*) malloc(col_idx_size);
     values = (float*) malloc(values_size);
@@ -141,8 +150,8 @@ void convert_csr(float * ptr, int32_t row, int32_t col, int32_t * &row_idx, int3
 int main()
 {
     string row_f, col_f, value_f;
-    int m=768, k=768, n=4096;
-    int sparsity = 0.95;
+    int m=6400, k=3072, n=768;
+    float sparsity = 0.875;
     matA = (float*) malloc(sizeof(float)*m*k);
     matB = (float*) malloc(sizeof(float)*k*n);
     matC = (float*) malloc(sizeof(float)*m*n);
@@ -168,25 +177,32 @@ int main()
     SortedRowSwizzle(m, row_idx, row_swizzle);
     CUDA_SAFE_CALL(cudaMemcpy(d_row_swizzle, row_swizzle, sizeof(int)*m, cudaMemcpyHostToDevice));
     int nnz = values_size / sizeof(float);
-    
-    CUDA_SAFE_CALL(CudaSpmm(m, k, n, nnz, d_row_swizzle, d_values, d_row_idx, d_col_idx, d_matB, d_matC, 0));
-    CUDA_SAFE_CALL(cudaMemcpy(matC, d_matC, sizeof(float)*m*n, cudaMemcpyDeviceToHost));
-    for(int i=0;i<20;i++)
-        std::cout<<matC[i]<<" ";
-    std::cout<<"\n"<<std::endl;
-    memset(matC, 0,sizeof(float)*m*n);
-    for(int i=0;i<m;i++){
-        for(int j=0; j<n;j++){
-            for(int tmp=0;tmp<k;tmp++){
-                // matc[i][j] = sum(A[i][tmp]*B[tmp][j])
-                matC[i*n+j] += matA[i*k+tmp] * matB[tmp*n+j];
-            }
-        }
+
+    printf("nnz: %d\n", nnz);
+
+    int n_iter = 100;
+    cudaEvent_t start, stop;
+
+    for(int i = 0; i < n_iter; i += 1){
+      CUDA_SAFE_CALL(CudaSpmm(m, k, n, nnz, d_row_swizzle, d_values, d_row_idx, d_col_idx, d_matB, d_matC, 0));
     }
-    // CUBLAS_SAFE_CALL(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, m, n, k, &alpha, d_matA, m, d_matB, k, &beta, d_matC, m));
-    // CUDA_SAFE_CALL(cudaMemcpy(matC, d_matC, sizeof(float)*m*n, cudaMemcpyDeviceToHost));
-    for(int i=0;i<20;i++)
-        std::cout<<matC[i]<<" ";
-    std::cout<<"\n"<<std::endl;
+    
+    CUDA_SAFE_CALL(cudaMemcpy(matC, d_matC, sizeof(float)*m*n, cudaMemcpyDeviceToHost));
+
+    checkCudaErrors(cudaEventCreate(&start));
+    checkCudaErrors(cudaEventCreate(&stop));
+    checkCudaErrors(cudaEventRecord(start));
+    for(int i = 0; i < n_iter; i += 1){
+      CUDA_SAFE_CALL(CudaSpmm(m, k, n, nnz, d_row_swizzle, d_values, d_row_idx, d_col_idx, d_matB, d_matC, 0));
+    }
+    checkCudaErrors(cudaEventRecord(stop));
+    checkCudaErrors(cudaEventSynchronize(stop));
+
+    float milliseconds = 0;
+
+    checkCudaErrors(cudaEventElapsedTime(&milliseconds, start, stop));
+  
+    printf("Time: %f ms\n", milliseconds / n_iter);
+
     return 0;
 }
